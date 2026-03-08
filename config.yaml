@@ -1,0 +1,118 @@
+# ==============================================================================
+# RMap Core Configuration
+# For detailed parameter explanations and dictionaries, please refer to the 
+# Reference Guide at the bottom of this file.
+# ==============================================================================
+
+engine:
+  max_concurrency: 100
+  timeout_ms: 2000
+  max_depth: 10
+  network_env: "dual"     
+  udp_buffer_size: 1232   
+  enable_cookie: true     
+  cookie_value: "random"
+  retries: 3              
+  retry_delay: "1s-3s"
+
+bootstrap:
+  root_servers:
+    - name: "a.root-servers.net"
+      ipv4: "198.41.0.4"
+      ipv6: "2001:503:ba3e::2:30"
+
+input:
+  direct_targets:
+    - { domain: "www.baidu.com", q_type: "A" }
+  file_targets:
+    enabled: false
+    path: "domains.txt"
+    default_q_type: "A"
+
+search:
+  enabled: true
+  
+  enable_rcode_check: true         
+  target_rcodes: [3, 5] 
+  match_invalid_rcode: true
+
+  enable_ede_check: true           
+  target_edes: ["*"] 
+  match_invalid_ede: true
+
+  enable_flags_check: true         
+  target_flags: ["aa", "tc", "qr"] 
+  
+  enable_issue_check: true         
+  target_issues: ["*"]
+
+  output_file: "./reports/search_results.jsonl"
+
+output:
+  report_dir: "./reports"
+  save_individual_reports: true  
+  save_search_results: false     
+
+
+# ==============================================================================
+# 📖 REFERENCE GUIDE & DICTIONARY
+# ==============================================================================
+#
+# [engine.network_env] 
+#   - Supported values: "ipv4", "ipv6", "dual" (Dual-stack)
+#
+# [engine.cookie_value]
+#   - "random" or "" : Automatically generates a random 8-byte Client Cookie.
+#   - Hex String     : Forces a static cookie (e.g., "1122334455667788").
+#
+# [search.target_rcodes]
+#   - 0: NoError  | 1: FormErr  | 2: ServFail | 3: NXDomain 
+#   - 4: NotImp   | 5: Refused  | 6: YXDomain | 7: YXRRSet 
+#   - 8: NXRRSet  | 9: NotAuth  | 10: NotZone | 16: BADVERS/BADSIG
+#   - 22: BADTRUNC| 23: BADCOOKIE | 24: BADMAC
+#
+# [search.target_edes] (Extended DNS Errors - RFC 8914)
+#   - Use ["*"] to match ANY EDE code.
+#   - 0: Other                   | 1: Unsupported DNSKEY Alg | 2: Unsupported DS Digest
+#   - 3: Stale Answer            | 4: Forged Answer          | 5: DNSSEC Indeterminate
+#   - 6: DNSSEC Bogus            | 7: Signature Expired      | 8: Signature Not Yet Valid
+#   - 9: DNSKEY Missing          | 10: RRSIGs Missing        | 11: No Zone Key Bit Set
+#   - 12: NSEC Missing           | 13: Cached Error          | 14: Not Ready
+#   - 15: Blocked                | 16: Censored              | 17: Filtered
+#   - 18: Prohibited             | 19: Stale NXDOMAIN        | 20: Not Authoritative
+#   - 21: Not Supported          | 22: No Reachable Auth     | 23: Network Error
+#
+# [search.target_flags]
+#   - "qr", "aa", "tc", "rd", "ra", "ad", "cd"
+#
+# [search.target_issues] (Vulnerability & Anomaly Audits)
+#   - Use ["*"] to match ANY audit anomaly.
+#
+#   -- [Delegation & Connectivity Failures] --
+#   "NETWORK_UNREACHABLE" : Network-level failure (Connection timeout, TCP reset, UDP drop).
+#   "LAME_SERVFAIL"       : Lame Delegation (Node returns SERVFAIL; likely upstream timeout or DNSSEC failure).
+#   "LAME_REFUSED"        : Lame Delegation/DoS (Node returns REFUSED; unauthorized or misconfigured upstream Zone).
+#
+#   -- [CNAME Protocol Violations (RFC Compliance)] --
+#   "CNAME_EXCLUSIVITY_VIOLATION" : Exclusivity Violation (Co-existence of CNAME and other records like TXT/MX on the same node).
+#   "CNAME_TARGET_IS_IP"          : Invalid Target (RFC mandates CNAME must point to a domain, not directly to an IP).
+#   "CNAME_AT_ZONE_APEX"          : Zone Apex Violation (CNAME incorrectly configured at the root domain; breaks MX delivery).
+#
+#   -- [Packet Anomalies & Redundancy] --
+#   "DUPLICATE_RESOURCE_RECORD" : Packet Redundancy (Server returned completely identical RR records, wasting bandwidth).
+#   "NODATA_RESPONSE"           : Ghost Empty Response (Status NOERROR, but Answer/Authority/Additional sections are entirely empty).
+#
+#   -- [Infrastructure & Geographic Risks] --
+#   "SINGLE_AS_EXPOSURE"   : Single Point of Failure (All authoritative NS for the domain reside within the same ASN/ISP).
+#   "SINGLE_CITY_EXPOSURE" : Geographic Concentration (All NS nodes are physically located in the same city, vulnerable to regional disasters).
+#
+#   -- [Core Security Risks & Hijacking Diagnostics] --
+#   "PRIVATE_IP_LEAKAGE"       : Internal IP Leakage (A public domain resolves to a private IP like 10.x / 192.168.x / 172.16.x).
+#   "NXDOMAIN_ABORT"           : Dangling/Takeover Risk (Resolution aborted with NXDOMAIN, indicating severe subdomain takeover vulnerability).
+#   "INCONSISTENT_ANSWERS"     : Split-Brain Resolution (Different authoritative NS servers returned conflicting IP sets for the same domain).
+#   "INFECTED_DELEGATION_PATH" : Malicious Resolution Link (An intermediate NS server's hostname or IP in the chain is flagged in Threat Intel).
+#   "MALICIOUS_CNAME_HIJACK"   : Malicious CNAME Hijack (A CNAME in the resolution chain is flagged in Threat Intel).
+#
+#   -- [Diagnostic Auxiliary Info] --
+#   "EXTENDED_DNS_ERROR" : EDE Triggered (Server actively returned an Extended DNS Error, e.g., blocked by firewall or filtered).
+# ==============================================================================
