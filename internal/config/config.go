@@ -25,6 +25,14 @@ const (
 	EnvDual NetworkEnv = "dual"
 )
 
+// AssetConfig defines the rules for printing discovered infrastructure assets (NS/CNAMEs).
+type AssetConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	ShowCNAMEs     bool `yaml:"show_cnames"`
+	ShowNS         bool `yaml:"show_ns"`
+	IncludeRootTLD bool `yaml:"include_root_tld"`
+}
+
 // Config represents the complete structure of the config.yaml file.
 type Config struct {
 	Engine struct {
@@ -63,9 +71,10 @@ type Config struct {
 	} `yaml:"input"`
 
 	Output struct {
-		ReportDir             string `yaml:"report_dir"`
-		SaveIndividualReports bool   `yaml:"save_individual_reports"`
-		SaveSearchResults     bool   `yaml:"save_search_results"`
+		ReportDir             string      `yaml:"report_dir"`
+		SaveIndividualReports bool        `yaml:"save_individual_reports"`
+		SaveSearchResults     bool        `yaml:"save_search_results"`
+		PrintAssets           AssetConfig `yaml:"print_assets"` // 🌟 Added configuration for asset printing
 	} `yaml:"output"`
 
 	Search struct {

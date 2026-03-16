@@ -51,8 +51,7 @@ type NodeMatch struct {
 	Issues      []string `json:"issues,omitempty"`
 }
 
-// DomainSearchResult represents a single line of output in the JSONL search results,
-// aggregating all matches for a target domain.
+// DomainSearchResult represents a single line of output in the JSONL search results.
 type DomainSearchResult struct {
 	TargetDomain string      `json:"target_domain"`
 	Matches      []NodeMatch `json:"matches"`
@@ -62,6 +61,10 @@ type DomainSearchResult struct {
 var (
 	searchResultFile *os.File
 	searchMutex      sync.Mutex
+
+	// 🌟 Added File and Mutex for concurrent asset writing
+	assetFile  *os.File
+	assetMutex sync.Mutex
 
 	matchCount int32 // Total number of domains that triggered anomalies
 
@@ -88,12 +91,12 @@ func main() {
 		return
 	}
 
-	// 2. Initialize external data (GeoIP databases and Threat Intelligence feeds)
+	// 2. Initialize external data
 	audit.InitExternalData(
 		"./assets/geo/GeoLite2-ASN.mmdb",
 		"./assets/geo/GeoLite2-City.mmdb",
-		"./assets/intel/threat_domains.txt", // Malicious domains feed
-		"./assets/intel/threat_ips.txt",     // Malicious IPs feed
+		"./assets/intel/threat_domains.txt",
+		"./assets/intel/threat_ips.txt",
 	)
 
 	rootIP := cfg.Bootstrap.RootServers[0].IPv4
@@ -103,20 +106,32 @@ func main() {
 
 	os.MkdirAll(cfg.Output.ReportDir, 0755)
 
-	// 3. Initialize search results output file (JSONL stream)
+	// 3. Initialize output files (Search Results & Asset Discovery)
 	if cfg.Search.Enabled && cfg.Output.SaveSearchResults {
 		outPath := cfg.Search.OutputFile
 		if outPath == "" {
 			outPath = filepath.Join(cfg.Output.ReportDir, "search_results.jsonl")
 		}
 		os.MkdirAll(filepath.Dir(outPath), 0755)
-		searchResultFile, err = os.Create(outPath)
+		searchResultFile, err = os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
 			fmt.Printf("❌ Failed to create search results file: %v\n", err)
 			return
 		}
 		defer searchResultFile.Close()
-		fmt.Printf(">>> 💾 Search results streaming enabled (JSONL): %s\n", outPath)
+		fmt.Printf(">>> 💾 Search results streaming enabled: %s\n", outPath)
+	}
+
+	// 🌟 Initialize Asset Output File
+	if cfg.Output.PrintAssets.Enabled {
+		assetPath := filepath.Join(cfg.Output.ReportDir, "discovered_assets.txt")
+		assetFile, err = os.OpenFile(assetPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			fmt.Printf("❌ Failed to create asset file: %v\n", err)
+		} else {
+			defer assetFile.Close()
+			fmt.Printf(">>> 💾 Asset discovery streaming enabled: %s\n", assetPath)
+		}
 	}
 
 	// 4. Bootstrapping concurrent worker pool
@@ -129,10 +144,6 @@ func main() {
 	var completedCount int32
 
 	fmt.Printf(">>> 🚀 Starting probing cluster... (Max Concurrency: %d)\n", workerCount)
-	if cfg.Search.Enabled {
-		fmt.Printf(">>> 🔎 Precision Search Mode -> Rcodes: %v | EDEs: %v | Issues: %v\n",
-			cfg.Search.TargetRcodes, cfg.Search.TargetEDEs, cfg.Search.TargetIssues)
-	}
 
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
@@ -150,7 +161,7 @@ func main() {
 		}()
 	}
 
-	// 5. Read target domains (File stream or direct config targets)
+	// 5. Read target domains
 	seen := make(map[string]bool)
 	if cfg.Input.FileTargets.Enabled && cfg.Input.FileTargets.Path != "" {
 		fmt.Printf("📂 Mode: Streaming targets from file -> %s\n", cfg.Input.FileTargets.Path)
@@ -190,7 +201,150 @@ func main() {
 	renderStatistics(startTime, completedCount, cfg)
 }
 
-// renderStatistics renders the final tree-structured statistics dashboard.
+func processDomain(t Target, cfg *config.Config, rootIP string) {
+	eng := engine.NewEngine(cfg)
+	eng.Run("", model.EdgeReferral, rootIP, t.Domain, t.QType, 0)
+	eng.WG.Wait()
+
+	issues := audit.RunAllAudits(eng.Graph, t.Domain)
+
+	// 🌟 Save discovered assets to file with Deduplication
+	SaveDiscoveredAssets(eng.Graph, t.Domain, &cfg.Output.PrintAssets)
+
+	nodeIssuesMap := make(map[string][]string)
+	for _, iss := range issues {
+		for _, nodeID := range iss.NodeIDs {
+			nodeIssuesMap[nodeID] = append(nodeIssuesMap[nodeID], iss.Type)
+		}
+	}
+
+	if cfg.Search.Enabled {
+		var localMatches []NodeMatch
+		var dHitRcode, dHitEde, dHitFlags, dHitIssues bool
+		dRcodes := make(map[int]bool)
+		dEdes := make(map[string]bool)
+		dFlags := make(map[string]bool)
+		dIssues := make(map[string]bool)
+
+		eng.Graph.Nodes.Range(func(_, v any) bool {
+			n := v.(*model.Node)
+			hRcode, hEde, hFlags, hIssues := false, false, false, false
+			currentIssues := nodeIssuesMap[n.ID]
+
+			if cfg.Search.EnableRcodeCheck {
+				for _, r := range cfg.Search.TargetRcodes {
+					if n.Rcode == r {
+						hRcode = true
+					}
+				}
+				if cfg.Search.MatchInvalidRcode && ((n.Rcode >= 11 && n.Rcode <= 15) || n.Rcode >= 25) {
+					hRcode = true
+				}
+				if hRcode {
+					dRcodes[n.Rcode] = true
+				}
+			}
+
+			if cfg.Search.EnableEdeCheck {
+				for _, target := range cfg.Search.TargetEDEs {
+					if (target == "*" && n.EDE != "") || (target != "" && strings.Contains(n.EDE, target)) {
+						hEde = true
+					}
+				}
+				if hEde && n.EDE != "" {
+					for _, p := range strings.Split(n.EDE, " | ") {
+						dEdes[strings.TrimSpace(p)] = true
+					}
+				}
+			}
+
+			if cfg.Search.EnableFlagsCheck {
+				nodeF := " " + n.Flags + " "
+				for _, tf := range cfg.Search.TargetFlags {
+					if strings.Contains(nodeF, " "+strings.ToLower(tf)+" ") {
+						hFlags = true
+					}
+				}
+				if hFlags {
+					for _, f := range strings.Fields(n.Flags) {
+						dFlags[strings.ToLower(f)] = true
+					}
+				}
+			}
+
+			if cfg.Search.EnableIssueCheck {
+				for _, actual := range currentIssues {
+					for _, target := range cfg.Search.TargetIssues {
+						if target == "*" || strings.EqualFold(actual, target) {
+							hIssues = true
+							dIssues[actual] = true
+						}
+					}
+				}
+			}
+
+			if hRcode || hEde || hFlags || hIssues {
+				if hRcode {
+					dHitRcode = true
+				}
+				if hEde {
+					dHitEde = true
+				}
+				if hFlags {
+					dHitFlags = true
+				}
+				if hIssues {
+					dHitIssues = true
+				}
+				localMatches = append(localMatches, NodeMatch{n.ID, n.Rcode, n.Flags, n.EDE, currentIssues})
+			}
+			return true
+		})
+
+		if len(localMatches) > 0 {
+			atomic.AddInt32(&matchCount, 1)
+			statDetailsLock.Lock()
+			if dHitRcode {
+				statRcodeHits++
+				for k := range dRcodes {
+					statRcodeDetails[k]++
+				}
+			}
+			if dHitEde {
+				statEdeHits++
+				for k := range dEdes {
+					statEdeDetails[k]++
+				}
+			}
+			if dHitFlags {
+				statFlagsHits++
+				for k := range dFlags {
+					statFlagsDetails[k]++
+				}
+			}
+			if dHitIssues {
+				statIssuesHits++
+				for k := range dIssues {
+					statIssuesDetails[k]++
+				}
+			}
+			statDetailsLock.Unlock()
+
+			if searchResultFile != nil {
+				jsonData, _ := json.Marshal(DomainSearchResult{t.Domain, localMatches})
+				searchMutex.Lock()
+				searchResultFile.Write(jsonData)
+				searchResultFile.WriteString("\n")
+				searchMutex.Unlock()
+			}
+		}
+	}
+
+	if cfg.Output.SaveIndividualReports {
+		saveReport(eng.Graph, t, issues, cfg.Output.ReportDir)
+	}
+}
+
 func renderStatistics(startTime time.Time, totalDomains int32, cfg *config.Config) {
 	totalElapsed := time.Since(startTime)
 	qps := float64(totalDomains) / totalElapsed.Seconds()
@@ -211,8 +365,7 @@ func renderStatistics(startTime time.Time, totalDomains int32, cfg *config.Confi
 		fmt.Printf("🎯 Total Hits: %d domains with anomalies (Pollution Rate: %.2f%%)\n", totalMatches, matchRate)
 
 		if totalMatches > 0 {
-			fmt.Printf("🔍 Anomaly Dimension Breakdown (Base: %d total domains):\n", totalDomains)
-
+			fmt.Printf("🔍 Anomaly Dimension Breakdown:\n")
 			statDetailsLock.Lock()
 			defer statDetailsLock.Unlock()
 
@@ -304,154 +457,6 @@ func printRcodeDetails(m map[int]int32, total int32, isParentLast bool) {
 	}
 }
 
-// processDomain handles the complete lifecycle of probing, auditing, and saving a domain.
-func processDomain(t Target, cfg *config.Config, rootIP string) {
-	eng := engine.NewEngine(cfg)
-	eng.Run("", model.EdgeReferral, rootIP, t.Domain, t.QType, 0)
-	eng.WG.Wait()
-
-	// Execute security and compliance audits
-	issues := audit.RunAllAudits(eng.Graph, t.Domain)
-
-	nodeIssuesMap := make(map[string][]string)
-	for _, iss := range issues {
-		for _, nodeID := range iss.NodeIDs {
-			nodeIssuesMap[nodeID] = append(nodeIssuesMap[nodeID], iss.Type)
-		}
-	}
-
-	if cfg.Search.Enabled {
-		var localMatches []NodeMatch
-		var dHitRcode, dHitEde, dHitFlags, dHitIssues bool
-		dRcodes := make(map[int]bool)
-		dEdes := make(map[string]bool)
-		dFlags := make(map[string]bool)
-		dIssues := make(map[string]bool)
-
-		eng.Graph.Nodes.Range(func(_, v any) bool {
-			n := v.(*model.Node)
-			hRcode, hEde, hFlags, hIssues := false, false, false, false
-			currentIssues := nodeIssuesMap[n.ID]
-
-			// RCODE matching logic
-			if cfg.Search.EnableRcodeCheck {
-				for _, r := range cfg.Search.TargetRcodes {
-					if n.Rcode == r {
-						hRcode = true
-					}
-				}
-				if cfg.Search.MatchInvalidRcode && ((n.Rcode >= 11 && n.Rcode <= 15) || n.Rcode >= 25) {
-					hRcode = true
-				}
-				if hRcode {
-					dRcodes[n.Rcode] = true
-				}
-			}
-
-			// EDE matching logic
-			if cfg.Search.EnableEdeCheck {
-				for _, target := range cfg.Search.TargetEDEs {
-					if (target == "*" && n.EDE != "") || (target != "" && strings.Contains(n.EDE, target)) {
-						hEde = true
-					}
-				}
-				if hEde && n.EDE != "" {
-					for _, p := range strings.Split(n.EDE, " | ") {
-						dEdes[strings.TrimSpace(p)] = true
-					}
-				}
-			}
-
-			// Flags matching logic
-			if cfg.Search.EnableFlagsCheck {
-				nodeF := " " + n.Flags + " "
-				for _, tf := range cfg.Search.TargetFlags {
-					if strings.Contains(nodeF, " "+strings.ToLower(tf)+" ") {
-						hFlags = true
-					}
-				}
-				if hFlags {
-					for _, f := range strings.Fields(n.Flags) {
-						dFlags[strings.ToLower(f)] = true
-					}
-				}
-			}
-
-			// Security Issues matching logic
-			if cfg.Search.EnableIssueCheck {
-				for _, actual := range currentIssues {
-					for _, target := range cfg.Search.TargetIssues {
-						if target == "*" || strings.EqualFold(actual, target) {
-							hIssues = true
-							dIssues[actual] = true
-						}
-					}
-				}
-			}
-
-			if hRcode || hEde || hFlags || hIssues {
-				if hRcode {
-					dHitRcode = true
-				}
-				if hEde {
-					dHitEde = true
-				}
-				if hFlags {
-					dHitFlags = true
-				}
-				if hIssues {
-					dHitIssues = true
-				}
-				localMatches = append(localMatches, NodeMatch{n.ID, n.Rcode, n.Flags, n.EDE, currentIssues})
-			}
-			return true
-		})
-
-		if len(localMatches) > 0 {
-			atomic.AddInt32(&matchCount, 1)
-			statDetailsLock.Lock()
-			if dHitRcode {
-				statRcodeHits++
-				for k := range dRcodes {
-					statRcodeDetails[k]++
-				}
-			}
-			if dHitEde {
-				statEdeHits++
-				for k := range dEdes {
-					statEdeDetails[k]++
-				}
-			}
-			if dHitFlags {
-				statFlagsHits++
-				for k := range dFlags {
-					statFlagsDetails[k]++
-				}
-			}
-			if dHitIssues {
-				statIssuesHits++
-				for k := range dIssues {
-					statIssuesDetails[k]++
-				}
-			}
-			statDetailsLock.Unlock()
-
-			if searchResultFile != nil {
-				jsonData, _ := json.Marshal(DomainSearchResult{t.Domain, localMatches})
-				searchMutex.Lock()
-				searchResultFile.Write(jsonData)
-				searchResultFile.WriteString("\n")
-				searchMutex.Unlock()
-			}
-		}
-	}
-
-	// Save individual topology report
-	if cfg.Output.SaveIndividualReports {
-		saveReport(eng.Graph, t, issues, cfg.Output.ReportDir)
-	}
-}
-
 func saveReport(g *model.Graph, t Target, issues []audit.Issue, dir string) {
 	export := g.Export()
 	final := ReportData{t.Domain, export.Nodes, export.Edges, export.NSRecords, issues}
@@ -487,6 +492,127 @@ func parseQType(qStr string) uint16 {
 	default:
 		return dns.TypeA
 	}
+}
+
+// =========================================================================
+// 🌟 资产提取、去重与文件写入 (Asset Discovery & Deduplication)
+// =========================================================================
+// =========================================================================
+// 🌟 资产提取、全局拍平去重与单行写入 (Flattened & Deduplicated Asset Output)
+// =========================================================================
+
+// SaveDiscoveredAssets extracts unique NS and CNAME assets, flattens the hierarchy,
+// globally deduplicates them, and writes exactly ONE line per domain to the file.
+func SaveDiscoveredAssets(g *model.Graph, target string, cfg *config.AssetConfig) {
+	if !cfg.Enabled || assetFile == nil {
+		return
+	}
+
+	var outputParts []string
+
+	// ---------------------------------------------------------
+	// 1. CNAME 拍平与去重 (无论跳转多少层，全部提取出来)
+	// ---------------------------------------------------------
+	if cfg.ShowCNAMEs {
+		cnames := make(map[string]bool)
+		for _, edge := range g.Edges {
+			if edge.Type == model.EdgeCnameDep {
+				if v, ok := g.Nodes.Load(edge.To); ok {
+					toDomain := v.(*model.Node).Domain
+					if toDomain != "" {
+						cnames[toDomain] = true
+					}
+				}
+			}
+		}
+
+		if len(cnames) > 0 {
+			var cList []string
+			for c := range cnames {
+				cList = append(cList, c)
+			}
+			sort.Strings(cList)
+			outputParts = append(outputParts, fmt.Sprintf("CNAME: %s", strings.Join(cList, ", ")))
+		}
+	}
+
+	// ---------------------------------------------------------
+	// 2. NS 全局拍平去重 (Map: NSName -> Map of valid IPs)
+	// 抛弃 Zone 的概念，直接以 NS 域名为唯一键！
+	// ---------------------------------------------------------
+	if cfg.ShowNS {
+		// nsMap 结构: nsMap[NSName] = map[ip]bool
+		nsMap := make(map[string]map[string]bool)
+
+		for _, ns := range g.NSRecords {
+			if !cfg.IncludeRootTLD && isRootOrTLD(ns.Zone) {
+				continue
+			}
+
+			// 初始化当前 NS 的 IP 集合
+			if nsMap[ns.NSName] == nil {
+				nsMap[ns.NSName] = make(map[string]bool)
+			}
+
+			// 只收集合法 IP (自动去重)
+			cleanIP := strings.TrimSpace(ns.IP)
+			if cleanIP != "" && cleanIP != "No Glue IP" {
+				nsMap[ns.NSName][cleanIP] = true
+			}
+		}
+
+		if len(nsMap) > 0 {
+			var nsNames []string
+			for name := range nsMap {
+				nsNames = append(nsNames, name)
+			}
+			sort.Strings(nsNames) // 保证 NS 的输出顺序一致
+
+			var nsGroup []string
+			for _, nsName := range nsNames {
+				var ips []string
+				for ip := range nsMap[nsName] {
+					ips = append(ips, ip)
+				}
+				sort.Strings(ips) // 保证同一个 NS 的多个 IP 顺序一致
+
+				// 有 IP 则带括号，没 IP 则只输出 NS 域名
+				if len(ips) > 0 {
+					nsGroup = append(nsGroup, fmt.Sprintf("%s(%s)", nsName, strings.Join(ips, "/")))
+				} else {
+					nsGroup = append(nsGroup, nsName)
+				}
+			}
+			outputParts = append(outputParts, fmt.Sprintf("NS: %s", strings.Join(nsGroup, ", ")))
+		}
+	}
+
+	// 如果什么资产都没发现，直接返回，不往文件里写垃圾数据
+	if len(outputParts) == 0 {
+		return
+	}
+
+	// ---------------------------------------------------------
+	// 3. 拼接成最终的单行格式： target: CNAME: ..., NS: ...
+	// ---------------------------------------------------------
+	finalLine := fmt.Sprintf("%s : %s\n", target, strings.Join(outputParts, " | "))
+
+	// 互斥锁：保证多协程并发写入安全
+	assetMutex.Lock()
+	assetFile.WriteString(finalLine)
+	assetMutex.Unlock()
+}
+
+// isRootOrTLD checks if a zone is the root zone (".") or a TLD (e.g., "com.", "cn.").
+func isRootOrTLD(zone string) bool {
+	cleanZone := strings.TrimSuffix(strings.ToLower(zone), ".")
+	if cleanZone == "" {
+		return true // Root
+	}
+	if strings.Count(cleanZone, ".") == 0 {
+		return true // TLD
+	}
+	return false
 }
 
 // package main

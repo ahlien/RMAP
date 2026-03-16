@@ -25,33 +25,40 @@ input:
   direct_targets:
     - { domain: "www.baidu.com", q_type: "A" }
   file_targets:
-    enabled: false
+    enabled: true
     path: "domains.txt"
     default_q_type: "A"
 
 search:
   enabled: true
   
-  enable_rcode_check: true         
-  target_rcodes: [3, 5] 
-  match_invalid_rcode: true
+  enable_rcode_check: true          
+  target_rcodes: [3] 
+  match_invalid_rcode: false   
 
-  enable_ede_check: true           
+  enable_ede_check: false           
   target_edes: ["*"] 
-  match_invalid_ede: true
+  match_invalid_ede: false   
 
-  enable_flags_check: true         
+  enable_flags_check: false         
   target_flags: ["aa", "tc", "qr"] 
   
   enable_issue_check: true         
-  target_issues: ["*"]
+  target_issues: ["NXDOMAIN_ABORT"]
 
   output_file: "./reports/search_results.jsonl"
 
 output:
   report_dir: "./reports"
-  save_individual_reports: true  
-  save_search_results: false     
+  save_individual_reports: false  
+  save_search_results: true     
+
+  # ================= 🌟 资产提取与打印 =================
+  print_assets:
+    enabled: true             # 总开关：是否在终端打印解析链路上的资产
+    show_cnames: true         # 是否打印 CNAME 别名记录
+    show_ns: true             # 是否打印 NS 委派记录
+    include_root_tld: false   # 是否包含 Root(.) 和 TLD(顶级域，如 .com) 的 NS 记录
 
 
 # ==============================================================================
